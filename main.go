@@ -38,7 +38,7 @@ const (
 	// Ограничения
 	MAX_PACKET_SIZE           = 65536
 	CONNECTION_TIMEOUT        = 60 // секунд
-	DISCOVERY_RETRY_INTERVAL  = 45 // секунд между попытками discovery
+	DISCOVERY_RETRY_INTERVAL  = 15 // секунд между попытками discovery
 	DISCOVERY_ATTEMPT_TIMEOUT = 20 // таймаут ожидания ответа на одну попытку
 	HEARTBEAT_INTERVAL        = 60 // секунд
 )
@@ -269,7 +269,7 @@ func (c *VPNClient) DiscoverAndConnect() error {
 	}
 	defer responseConn.Close()
 
-	// Отправляем discovery пакет несколько раз
+	c.log(fmt.Sprintf("Listening for responses on %s", responseConn.LocalAddr().String())) // ДОБАВЛЕНО
 	// Отправляем discovery пакет несколько раз
 	discoveryAttempts := 3
 	for i := 0; i < discoveryAttempts; i++ {
@@ -296,12 +296,15 @@ func (c *VPNClient) DiscoverAndConnect() error {
 			c.log(fmt.Sprintf("Error reading discovery response: %v", err))
 			if i < discoveryAttempts-1 {
 				time.Sleep(DISCOVERY_RETRY_INTERVAL * time.Second) // ДОБАВЛЕНО: пауза при ошибке
+			} else {
+				c.log(fmt.Sprintf("Received %d bytes from server %v", n, serverAddr)) // ДОБАВЛЕНО
 			}
 			continue
 		}
 
 		// Парсим ответ
 		if n >= 82 { // ИЗМЕНЕНО: с 50 на 82 - минимальный размер HandshakeResponse
+			c.log(fmt.Sprintf("Parsing handshake response (%d bytes)", n)) // ДОБАВЛЕНО
 			response, err := c.parseHandshakeResponse(buffer[:n])
 			if err != nil {
 				c.log(fmt.Sprintf("Invalid handshake response: %v", err))
@@ -314,6 +317,8 @@ func (c *VPNClient) DiscoverAndConnect() error {
 			if err := c.connectDTLS(serverAddr, response); err != nil {
 				c.log(fmt.Sprintf("DTLS connection failed: %v", err))
 				continue
+			} else {
+				c.log(fmt.Sprintf("Response too small: %d bytes, expected at least 82", n)) // ДОБАВЛЕНО
 			}
 
 			c.connMu.Lock()
