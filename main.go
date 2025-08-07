@@ -25,7 +25,7 @@ import (
 const (
 	MULTICAST_ADDR = "224.0.0.251:8888"
 	MAGIC_BYTES    = "VPNR"
-	SHARED_SECRET  = "your-shared-secret-here" // Должен совпадать с сервером
+	SHARED_SECRET  = "2108" // Должен совпадать с сервером
 
 	// Типы пакетов (копируем с сервера)
 	PACKET_HTTP     = 1
@@ -332,7 +332,26 @@ func (c *VPNClient) createDiscoveryPacket() []byte {
 	}
 
 	copy(packet.Magic[:], []byte(MAGIC_BYTES))
-	copy(packet.PublicKey[:], c.publicKey.Bytes())
+
+	// Получаем публичный ключ в правильном формате
+	pubKeyBytes := c.publicKey.Bytes()
+
+	// ECDH P256 ключ может быть 33 байта (compressed) или 65 байт (uncompressed)
+	// Нам нужно использовать только X-координату (первые 32 байта после префикса)
+	if len(pubKeyBytes) == 33 && pubKeyBytes[0] == 0x02 || pubKeyBytes[0] == 0x03 {
+		// Compressed формат: префикс + X координата (32 байта)
+		copy(packet.PublicKey[:], pubKeyBytes[1:33])
+	} else if len(pubKeyBytes) == 65 && pubKeyBytes[0] == 0x04 {
+		// Uncompressed формат: префикс + X координата (32 байта) + Y координата (32 байта)
+		copy(packet.PublicKey[:], pubKeyBytes[1:33])
+	} else {
+		// Используем как есть, если формат неожиданный
+		if len(pubKeyBytes) >= 32 {
+			copy(packet.PublicKey[:], pubKeyBytes[:32])
+		} else {
+			copy(packet.PublicKey[:len(pubKeyBytes)], pubKeyBytes)
+		}
+	}
 
 	// Сериализация пакета
 	data := make([]byte, 60) // 4 + 16 + 32 + 8 = 60 байт
@@ -362,10 +381,21 @@ func (c *VPNClient) parseHandshakeResponse(data []byte) (*HandshakeResponse, err
 func (c *VPNClient) connectDTLS(serverAddr *net.UDPAddr, response *HandshakeResponse) error {
 	c.log("Establishing DTLS connection...")
 
-	// Вычисляем общий ключ
-	serverPublicKey, err := ecdh.P256().NewPublicKey(response.PublicKey[:])
+	// Восстанавливаем публичный ключ сервера из X-координаты
+	// Создаем uncompressed точку: 0x04 + X (32 байта) + Y (32 байта)
+	// Но у нас только X координата, поэтому используем compressed формат
+	serverPubKeyBytes := make([]byte, 33)
+	serverPubKeyBytes[0] = 0x02 // compressed формат (четная Y координата, попробуем сначала)
+	copy(serverPubKeyBytes[1:], response.PublicKey[:])
+
+	serverPublicKey, err := ecdh.P256().NewPublicKey(serverPubKeyBytes)
 	if err != nil {
-		return fmt.Errorf("invalid server public key: %v", err)
+		// Попробуем нечетную Y координату
+		serverPubKeyBytes[0] = 0x03
+		serverPublicKey, err = ecdh.P256().NewPublicKey(serverPubKeyBytes)
+		if err != nil {
+			return fmt.Errorf("invalid server public key: %v", err)
+		}
 	}
 
 	sharedSecret, err := c.privateKey.ECDH(serverPublicKey)
