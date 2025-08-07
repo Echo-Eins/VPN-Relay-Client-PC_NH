@@ -46,13 +46,13 @@ const (
 type DiscoveryPacket struct {
 	Magic     [4]byte
 	ClientID  [16]byte
-	PublicKey [32]byte
+	PublicKey [33]byte
 	Timestamp int64
 }
 
 type HandshakeResponse struct {
 	SessionID [16]byte
-	PublicKey [32]byte
+	PublicKey [33]byte
 	DTLSPort  uint16
 }
 
@@ -187,6 +187,15 @@ func NewVPNClient() (*VPNClient, error) {
 	privateKey, err := curve.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate ECDH key: %v", err)
+	}
+
+	// Проверяем формат публичного ключа
+	publicKeyBytes := privateKey.PublicKey().Bytes()
+	log.Printf("Client public key format: length=%d, prefix=%02x", len(publicKeyBytes), publicKeyBytes[0])
+
+	if len(publicKeyBytes) != 33 || (publicKeyBytes[0] != 0x02 && publicKeyBytes[0] != 0x03) {
+		return nil, fmt.Errorf("Unexpected public key format: expected 33 bytes with 0x02/0x03 prefix, got %d bytes with %02x prefix",
+			len(publicKeyBytes), publicKeyBytes[0])
 	}
 
 	// Генерируем уникальный client ID
@@ -333,46 +342,40 @@ func (c *VPNClient) createDiscoveryPacket() []byte {
 
 	copy(packet.Magic[:], []byte(MAGIC_BYTES))
 
-	// Получаем публичный ключ в правильном формате
+	// Получаем публичный ключ и сохраняем в compressed формате
 	pubKeyBytes := c.publicKey.Bytes()
 
-	// ECDH P256 ключ может быть 33 байта (compressed) или 65 байт (uncompressed)
-	// Нам нужно использовать только X-координату (первые 32 байта после префикса)
-	if len(pubKeyBytes) == 33 && pubKeyBytes[0] == 0x02 || pubKeyBytes[0] == 0x03 {
-		// Compressed формат: префикс + X координата (32 байта)
-		copy(packet.PublicKey[:], pubKeyBytes[1:33])
+	if len(pubKeyBytes) == 33 {
+		// Уже в compressed формате
+		copy(packet.PublicKey[:], pubKeyBytes)
 	} else if len(pubKeyBytes) == 65 && pubKeyBytes[0] == 0x04 {
-		// Uncompressed формат: префикс + X координата (32 байта) + Y координата (32 байта)
-		copy(packet.PublicKey[:], pubKeyBytes[1:33])
+		// Uncompressed формат - нужно конвертировать в compressed
+		// Это сложнее, проще всего пересоздать ключ
+		log.Fatalf("Uncompressed public key format not supported in this implementation")
 	} else {
-		// Используем как есть, если формат неожиданный
-		if len(pubKeyBytes) >= 32 {
-			copy(packet.PublicKey[:], pubKeyBytes[:32])
-		} else {
-			copy(packet.PublicKey[:len(pubKeyBytes)], pubKeyBytes)
-		}
+		log.Fatalf("Unknown public key format: length=%d, prefix=%02x", len(pubKeyBytes), pubKeyBytes[0])
 	}
 
-	// Сериализация пакета
-	data := make([]byte, 60) // 4 + 16 + 32 + 8 = 60 байт
+	// Сериализация пакета - теперь 61 байт (4 + 16 + 33 + 8)
+	data := make([]byte, 61)
 	copy(data[0:4], packet.Magic[:])
 	copy(data[4:20], packet.ClientID[:])
-	copy(data[20:52], packet.PublicKey[:])
-	binary.LittleEndian.PutUint64(data[52:60], uint64(packet.Timestamp))
+	copy(data[20:53], packet.PublicKey[:])
+	binary.LittleEndian.PutUint64(data[53:61], uint64(packet.Timestamp))
 
 	return data
 }
 
 // Парсинг handshake ответа
 func (c *VPNClient) parseHandshakeResponse(data []byte) (*HandshakeResponse, error) {
-	if len(data) < 50 {
+	if len(data) < 51 { // Изменено с 50 на 51
 		return nil, fmt.Errorf("response too short")
 	}
 
 	response := &HandshakeResponse{}
 	copy(response.SessionID[:], data[0:16])
-	copy(response.PublicKey[:], data[16:48])
-	response.DTLSPort = binary.LittleEndian.Uint16(data[48:50])
+	copy(response.PublicKey[:], data[16:49]) // Изменено диапазон
+	response.DTLSPort = binary.LittleEndian.Uint16(data[49:51])
 
 	return response, nil
 }
@@ -381,21 +384,10 @@ func (c *VPNClient) parseHandshakeResponse(data []byte) (*HandshakeResponse, err
 func (c *VPNClient) connectDTLS(serverAddr *net.UDPAddr, response *HandshakeResponse) error {
 	c.log("Establishing DTLS connection...")
 
-	// Восстанавливаем публичный ключ сервера из X-координаты
-	// Создаем uncompressed точку: 0x04 + X (32 байта) + Y (32 байта)
-	// Но у нас только X координата, поэтому используем compressed формат
-	serverPubKeyBytes := make([]byte, 33)
-	serverPubKeyBytes[0] = 0x02 // compressed формат (четная Y координата, попробуем сначала)
-	copy(serverPubKeyBytes[1:], response.PublicKey[:])
-
-	serverPublicKey, err := ecdh.P256().NewPublicKey(serverPubKeyBytes)
+	// Теперь у нас полный compressed публичный ключ сервера
+	serverPublicKey, err := ecdh.P256().NewPublicKey(response.PublicKey[:])
 	if err != nil {
-		// Попробуем нечетную Y координату
-		serverPubKeyBytes[0] = 0x03
-		serverPublicKey, err = ecdh.P256().NewPublicKey(serverPubKeyBytes)
-		if err != nil {
-			return fmt.Errorf("invalid server public key: %v", err)
-		}
+		return fmt.Errorf("invalid server public key: %v", err)
 	}
 
 	sharedSecret, err := c.privateKey.ECDH(serverPublicKey)
