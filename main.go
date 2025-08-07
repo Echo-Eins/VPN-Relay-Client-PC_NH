@@ -36,23 +36,24 @@ const (
 	PACKET_ERROR    = 200
 
 	// Ограничения
-	MAX_PACKET_SIZE    = 65536
-	CONNECTION_TIMEOUT = 10 // секунд
-	DISCOVERY_TIMEOUT  = 30 // секунд
-	HEARTBEAT_INTERVAL = 60 // секунд
+	MAX_PACKET_SIZE           = 65536
+	CONNECTION_TIMEOUT        = 60 // секунд
+	DISCOVERY_RETRY_INTERVAL  = 45 // секунд между попытками discovery
+	DISCOVERY_ATTEMPT_TIMEOUT = 20 // таймаут ожидания ответа на одну попытку
+	HEARTBEAT_INTERVAL        = 60 // секунд
 )
 
 // Структуры протокола (идентичны серверу)
 type DiscoveryPacket struct {
 	Magic     [4]byte
 	ClientID  [16]byte
-	PublicKey [33]byte
+	PublicKey [65]byte
 	Timestamp int64
 }
 
 type HandshakeResponse struct {
 	SessionID [16]byte
-	PublicKey [33]byte
+	PublicKey [65]byte
 	DTLSPort  uint16
 }
 
@@ -193,8 +194,8 @@ func NewVPNClient() (*VPNClient, error) {
 	publicKeyBytes := privateKey.PublicKey().Bytes()
 	log.Printf("Client public key format: length=%d, prefix=%02x", len(publicKeyBytes), publicKeyBytes[0])
 
-	if len(publicKeyBytes) != 33 || (publicKeyBytes[0] != 0x02 && publicKeyBytes[0] != 0x03) {
-		return nil, fmt.Errorf("Unexpected public key format: expected 33 bytes with 0x02/0x03 prefix, got %d bytes with %02x prefix",
+	if len(publicKeyBytes) != 65 || publicKeyBytes[0] != 0x04 { // ИЗМЕНЕНО: проверяем 65 байт и префикс 0x04
+		return nil, fmt.Errorf("Unexpected public key format: expected 65 bytes with 0x04 prefix, got %d bytes with %02x prefix",
 			len(publicKeyBytes), publicKeyBytes[0])
 	}
 
@@ -269,6 +270,7 @@ func (c *VPNClient) DiscoverAndConnect() error {
 	defer responseConn.Close()
 
 	// Отправляем discovery пакет несколько раз
+	// Отправляем discovery пакет несколько раз
 	discoveryAttempts := 3
 	for i := 0; i < discoveryAttempts; i++ {
 		c.log(fmt.Sprintf("Sending discovery packet (attempt %d/%d)", i+1, discoveryAttempts))
@@ -279,20 +281,27 @@ func (c *VPNClient) DiscoverAndConnect() error {
 		}
 
 		// Ждем ответ с таймаутом
-		responseConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		responseConn.SetReadDeadline(time.Now().Add(DISCOVERY_ATTEMPT_TIMEOUT * time.Second)) // ИЗМЕНЕНО: с 5 на DISCOVERY_ATTEMPT_TIMEOUT
 		buffer := make([]byte, 1024)
 
 		n, serverAddr, err := responseConn.ReadFromUDP(buffer)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if i < discoveryAttempts-1 { // Если не последняя попытка
+					c.log(fmt.Sprintf("Discovery timeout, waiting %d seconds before retry...", DISCOVERY_RETRY_INTERVAL))
+					time.Sleep(DISCOVERY_RETRY_INTERVAL * time.Second) // ДОБАВЛЕНО: пауза между попытками
+				}
 				continue // Таймаут, пробуем еще раз
 			}
 			c.log(fmt.Sprintf("Error reading discovery response: %v", err))
+			if i < discoveryAttempts-1 {
+				time.Sleep(DISCOVERY_RETRY_INTERVAL * time.Second) // ДОБАВЛЕНО: пауза при ошибке
+			}
 			continue
 		}
 
 		// Парсим ответ
-		if n >= 50 { // Минимальный размер HandshakeResponse
+		if n >= 82 { // ИЗМЕНЕНО: с 50 на 82 - минимальный размер HandshakeResponse
 			response, err := c.parseHandshakeResponse(buffer[:n])
 			if err != nil {
 				c.log(fmt.Sprintf("Invalid handshake response: %v", err))
@@ -342,40 +351,36 @@ func (c *VPNClient) createDiscoveryPacket() []byte {
 
 	copy(packet.Magic[:], []byte(MAGIC_BYTES))
 
-	// Получаем публичный ключ и сохраняем в compressed формате
+	// Получаем публичный ключ и сохраняем в uncompressed формате
 	pubKeyBytes := c.publicKey.Bytes()
 
-	if len(pubKeyBytes) == 33 {
-		// Уже в compressed формате
+	if len(pubKeyBytes) == 65 && pubKeyBytes[0] == 0x04 { // ИЗМЕНЕНО: проверяем uncompressed формат
+		// Уже в uncompressed формате
 		copy(packet.PublicKey[:], pubKeyBytes)
-	} else if len(pubKeyBytes) == 65 && pubKeyBytes[0] == 0x04 {
-		// Uncompressed формат - нужно конвертировать в compressed
-		// Это сложнее, проще всего пересоздать ключ
-		log.Fatalf("Uncompressed public key format not supported in this implementation")
 	} else {
-		log.Fatalf("Unknown public key format: length=%d, prefix=%02x", len(pubKeyBytes), pubKeyBytes[0])
+		log.Fatalf("Unexpected public key format: length=%d, prefix=%02x", len(pubKeyBytes), pubKeyBytes[0])
 	}
 
-	// Сериализация пакета - теперь 61 байт (4 + 16 + 33 + 8)
-	data := make([]byte, 61)
+	// Сериализация пакета - теперь 93 байта (4 + 16 + 65 + 8)  // ИЗМЕНЕНО: с 61 на 93
+	data := make([]byte, 93) // ИЗМЕНЕНО: с 61 на 93
 	copy(data[0:4], packet.Magic[:])
 	copy(data[4:20], packet.ClientID[:])
-	copy(data[20:53], packet.PublicKey[:])
-	binary.LittleEndian.PutUint64(data[53:61], uint64(packet.Timestamp))
+	copy(data[20:85], packet.PublicKey[:])                               // ИЗМЕНЕНО: с data[20:53] на data[20:85]
+	binary.LittleEndian.PutUint64(data[85:93], uint64(packet.Timestamp)) // ИЗМЕНЕНО: с data[53:61] на data[85:93]
 
 	return data
 }
 
 // Парсинг handshake ответа
 func (c *VPNClient) parseHandshakeResponse(data []byte) (*HandshakeResponse, error) {
-	if len(data) < 51 { // Изменено с 50 на 51
+	if len(data) < 83 { // ИЗМЕНЕНО: с 51 на 83
 		return nil, fmt.Errorf("response too short")
 	}
 
 	response := &HandshakeResponse{}
 	copy(response.SessionID[:], data[0:16])
-	copy(response.PublicKey[:], data[16:49]) // Изменено диапазон
-	response.DTLSPort = binary.LittleEndian.Uint16(data[49:51])
+	copy(response.PublicKey[:], data[16:81])                    // ИЗМЕНЕНО: с data[16:49] на data[16:81]
+	response.DTLSPort = binary.LittleEndian.Uint16(data[81:83]) // ИЗМЕНЕНО: с data[49:51] на data[81:83]
 
 	return response, nil
 }
@@ -384,7 +389,7 @@ func (c *VPNClient) parseHandshakeResponse(data []byte) (*HandshakeResponse, err
 func (c *VPNClient) connectDTLS(serverAddr *net.UDPAddr, response *HandshakeResponse) error {
 	c.log("Establishing DTLS connection...")
 
-	// Теперь у нас полный compressed публичный ключ сервера
+	// Теперь у нас полный uncompressed публичный ключ сервера  // ИЗМЕНЕНО: compressed на uncompressed
 	serverPublicKey, err := ecdh.P256().NewPublicKey(response.PublicKey[:])
 	if err != nil {
 		return fmt.Errorf("invalid server public key: %v", err)
