@@ -167,6 +167,7 @@ type VPNClient struct {
 	stopChan      chan struct{}
 	logChan       chan string
 	heartbeatChan chan struct{}
+	guiUpdateChan chan func() // НОВЫЙ канал для обновлений GUI
 
 	// Мьютексы
 	connMu     sync.RWMutex
@@ -217,6 +218,7 @@ func NewVPNClient() (*VPNClient, error) {
 		stopChan:        make(chan struct{}),
 		logChan:         make(chan string, 1000),
 		heartbeatChan:   make(chan struct{}),
+		guiUpdateChan:   make(chan func(), 100), // НОВЫЙ канал
 		httpProxyPort:   8080,
 		dnsServerPort:   5353,
 	}
@@ -502,6 +504,11 @@ func (c *VPNClient) handleServerPackets() {
 	consecutiveErrors := 0
 	maxConsecutiveErrors := 3
 
+	// ИСПРАВЛЕНИЕ: Инициализируем время последнего heartbeat
+	c.connMu.Lock()
+	c.lastHeartbeat = time.Now()
+	c.connMu.Unlock()
+
 	for {
 		select {
 		case <-c.stopChan:
@@ -511,12 +518,25 @@ func (c *VPNClient) handleServerPackets() {
 		}
 
 		// Читаем пакет
-		c.dtlsConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		c.dtlsConn.SetReadDeadline(time.Now().Add(45 * time.Second)) // ИСПРАВЛЕНИЕ: Увеличиваем таймаут
 		n, err := c.dtlsConn.Read(buffer)
 
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				c.log("⏰ Read timeout, sending heartbeat...")
+				c.log("⏰ Read timeout, checking connection health...")
+
+				// ИСПРАВЛЕНИЕ: При таймауте проверяем здоровье соединения
+				c.connMu.RLock()
+				timeSinceLastActivity := time.Since(c.lastHeartbeat)
+				c.connMu.RUnlock()
+
+				if timeSinceLastActivity > 90*time.Second {
+					c.log(fmt.Sprintf("💀 No server activity for %.0f seconds, connection may be dead",
+						timeSinceLastActivity.Seconds()))
+					go c.onConnectionLost()
+					return
+				}
+
 				// Отправляем heartbeat при таймауте
 				go func() {
 					select {
@@ -573,7 +593,7 @@ func (c *VPNClient) handleServerPackets() {
 		c.connMu.Lock()
 		c.totalPacketsIn++
 		c.totalBytesIn += uint64(n)
-		c.lastHeartbeat = time.Now()
+		c.lastHeartbeat = time.Now() // ИСПРАВЛЕНИЕ: Обновляем время при любом полученном пакете
 		c.connMu.Unlock()
 
 		// Обрабатываем пакет
@@ -585,6 +605,15 @@ func (c *VPNClient) handleServerPackets() {
 func (c *VPNClient) handleServerPacket(header *PacketHeader, payload []byte) {
 	switch header.Type {
 	case PACKET_RESPONSE:
+		// ИСПРАВЛЕНИЕ: Проверяем на keepalive пакеты
+		if header.ID == 0 && len(payload) == 4 && string(payload) == "KEEP" {
+			c.log("💓 Received keepalive from server")
+			// Обновляем время последнего сообщения
+			c.connMu.Lock()
+			c.lastHeartbeat = time.Now()
+			c.connMu.Unlock()
+			return
+		}
 		c.handleResponse(header.ID, payload)
 	case PACKET_ERROR:
 		c.handleError(header.ID, payload)
@@ -1369,6 +1398,19 @@ func (c *VPNClient) onConnectionLost() {
 	c.log(fmt.Sprintf("🧹 Cleaned up %d pending requests", requestCount))
 
 	c.log("💔 Connection cleanup completed")
+
+	// ИСПРАВЛЕНИЕ: Попытка автоматического переподключения
+	if c.reconnectCount < 5 {
+		c.log(fmt.Sprintf("🔄 Attempting automatic reconnection in 10 seconds (attempt %d/5)", c.reconnectCount))
+		time.Sleep(10 * time.Second)
+		go func() {
+			if err := c.DiscoverAndConnect(); err != nil {
+				c.log(fmt.Sprintf("🚫 Automatic reconnection failed: %v", err))
+			}
+		}()
+	} else {
+		c.log("🚫 Max reconnection attempts reached, manual intervention required")
+	}
 }
 
 // Отключение от сервера
@@ -1412,11 +1454,46 @@ func (c *VPNClient) heartbeatRoutine() {
 			return
 		case <-ticker.C:
 			if c.isConnected {
-				// Отправляем heartbeat (можно использовать пустой DNS запрос)
+				c.connMu.RLock()
+				lastHeartbeat := c.lastHeartbeat
+				c.connMu.RUnlock()
+
+				// ИСПРАВЛЕНИЕ: Проверяем, когда последний раз получали данные от сервера
+				timeSinceLastHeartbeat := time.Since(lastHeartbeat)
+				if timeSinceLastHeartbeat > 2*HEARTBEAT_INTERVAL*time.Second {
+					c.log(fmt.Sprintf("⚠️ No server activity for %.0f seconds, sending heartbeat",
+						timeSinceLastHeartbeat.Seconds()))
+				}
+
+				// Отправляем heartbeat DNS запрос
 				go func() {
 					_, err := c.ResolveDNS("heartbeat.local", dns.TypeA)
 					if err != nil {
-						c.log(fmt.Sprintf("Heartbeat failed: %v", err))
+						c.log(fmt.Sprintf("💔 Heartbeat failed: %v", err))
+
+						// ИСПРАВЛЕНИЕ: После нескольких неудачных heartbeat считаем соединение потерянным
+						c.connMu.Lock()
+						c.reconnectCount++
+						if c.reconnectCount >= 3 {
+							c.log("💀 Multiple heartbeat failures, connection lost")
+							go c.onConnectionLost()
+						}
+						c.connMu.Unlock()
+					} else {
+						c.log("💓 Heartbeat successful")
+						c.connMu.Lock()
+						c.reconnectCount = 0 // Сбрасываем счетчик при успешном heartbeat
+						c.connMu.Unlock()
+					}
+				}()
+			}
+		case <-c.heartbeatChan:
+			// Принудительный heartbeat
+			if c.isConnected {
+				go func() {
+					_, err := c.ResolveDNS("heartbeat.local", dns.TypeA)
+					if err != nil {
+						c.log(fmt.Sprintf("💔 Manual heartbeat failed: %v", err))
 					}
 				}()
 			}
@@ -1507,21 +1584,18 @@ func (c *VPNClient) CreateGUI() fyne.Window {
 	// Статус соединения
 	c.statusLabel = widget.NewLabel("Status: Disconnected")
 	c.statusLabel.TextStyle.Bold = true
-
 	c.connectionLabel = widget.NewLabel("Server: Not connected")
 
-	// Кнопки управления подключением
+	// ИСПРАВЛЯЕМ кнопки управления подключением
 	c.connectButton = widget.NewButton("Connect to Server", func() {
-		// Отключаем кнопку сразу в UI thread
 		c.connectButton.Disable()
-
-		// Запускаем подключение в отдельной горутине
 		go func() {
 			defer func() {
-				// Включаем кнопку обратно через fyne.NewWithoutData
-				fyne.NewWithoutData(func() {
-					c.connectButton.Enable()
-				}).Run()
+				// ИСПРАВЛЕНИЕ: Отправляем функцию обновления через канал
+				select {
+				case c.guiUpdateChan <- func() { c.connectButton.Enable() }:
+				default:
+				}
 			}()
 
 			if err := c.DiscoverAndConnect(); err != nil {
@@ -1545,7 +1619,6 @@ func (c *VPNClient) CreateGUI() fyne.Window {
 	c.httpPortEntry = widget.NewEntry()
 	c.httpPortEntry.SetText(fmt.Sprintf("%d", c.httpProxyPort))
 	c.httpPortEntry.OnChanged = func(text string) {
-		// OnChanged уже вызывается в UI thread
 		if port := parseInt(text); port > 0 && port < 65536 {
 			c.httpProxyPort = port
 		}
@@ -1784,37 +1857,40 @@ func (c *VPNClient) updateGUI() {
 		select {
 		case <-c.stopChan:
 			return
+
 		case logMessage := <-c.logChan:
-			// ИСПРАВЛЕНИЕ: Обновление GUI через fyne.NewWithoutData
+			// ИСПРАВЛЕНИЕ: Прямое обновление в GUI потоке
 			if c.logText != nil {
-				// Используем NewWithoutData для безопасного обновления из горутины
-				fyne.NewWithoutData(func() {
-					currentText := c.logText.Text
-					newText := currentText + logMessage + "\n"
+				currentText := c.logText.Text
+				newText := currentText + logMessage + "\n"
 
-					// Ограничиваем размер лога
-					lines := strings.Split(newText, "\n")
-					if len(lines) > 1000 {
-						lines = lines[len(lines)-1000:]
-						newText = strings.Join(lines, "\n")
-					}
+				// Ограничиваем размер лога
+				lines := strings.Split(newText, "\n")
+				if len(lines) > 1000 {
+					lines = lines[len(lines)-1000:]
+					newText = strings.Join(lines, "\n")
+				}
 
-					c.logText.SetText(newText)
-					c.logText.CursorRow = len(lines) - 1
-				}).Run()
+				c.logText.SetText(newText)
+				c.logText.CursorRow = len(lines) - 1
 			}
+
+		case guiUpdate := <-c.guiUpdateChan:
+			// НОВЫЙ: Обработка обновлений GUI
+			if guiUpdate != nil {
+				guiUpdate()
+			}
+
 		case <-ticker.C:
-			// ИСПРАВЛЕНИЕ: Обновление статуса через fyne.NewWithoutData
-			fyne.NewWithoutData(func() {
-				c.updateStatus()
-			}).Run()
+			// ИСПРАВЛЕНИЕ: Прямое обновление статуса
+			c.updateStatus()
 		}
 	}
 }
 
 // Исправленный updateStatus для клиента
 func (c *VPNClient) updateStatus() {
-	// Эта функция теперь вызывается ТОЛЬКО из UI thread через fyne.NewWithoutData
+	// Эта функция вызывается из updateGUI, поэтому уже в правильном потоке
 	if c.statusLabel == nil {
 		return
 	}
