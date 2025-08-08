@@ -230,7 +230,7 @@ func NewVPNClient() (*VPNClient, error) {
 
 // === DISCOVERY И ПОДКЛЮЧЕНИЕ ===
 
-// Поиск и подключение к серверу
+// Поиск и подключение к серверу - ИСПРАВЛЕННАЯ ВЕРСИЯ
 func (c *VPNClient) DiscoverAndConnect() error {
 	c.connMu.Lock()
 	if c.isConnected || c.isDiscovering {
@@ -250,61 +250,62 @@ func (c *VPNClient) DiscoverAndConnect() error {
 		return fmt.Errorf("failed to resolve multicast address: %v", err)
 	}
 
-	// Создаем обычное UDP соединение для отправки multicast
-	conn, err := net.DialUDP("udp", nil, addr)
+	// ИСПРАВЛЕНИЕ: Создаем UDP соединение, которое может отправлять И получать
+	// Используем локальный адрес с портом 0 (случайный порт)
+	localAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+
+	// Создаем UDP соединение для отправки и получения
+	conn, err := net.ListenUDP("udp", localAddr)
 	if err != nil {
 		c.setConnectionState("Discovery Failed")
-		return fmt.Errorf("failed to create multicast connection: %v", err)
+		return fmt.Errorf("failed to create UDP connection: %v", err)
 	}
 	defer conn.Close()
+
+	// Получаем реальный локальный адрес (с назначенным системой портом)
+	actualLocalAddr := conn.LocalAddr().(*net.UDPAddr)
+	c.log(fmt.Sprintf("Listening for responses on %s", actualLocalAddr.String()))
 
 	// Создаем discovery пакет
 	discoveryPacket := c.createDiscoveryPacket()
 
-	// Также создаем UDP соединение для получения ответа
-	responseConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
-	if err != nil {
-		c.setConnectionState("Discovery Failed")
-		return fmt.Errorf("failed to create response listener: %v", err)
-	}
-	defer responseConn.Close()
-
-	c.log(fmt.Sprintf("Listening for responses on %s", responseConn.LocalAddr().String())) // ДОБАВЛЕНО
 	// Отправляем discovery пакет несколько раз
 	discoveryAttempts := 3
 	for i := 0; i < discoveryAttempts; i++ {
 		c.log(fmt.Sprintf("Sending discovery packet (attempt %d/%d)", i+1, discoveryAttempts))
 
-		if _, err := conn.Write(discoveryPacket); err != nil {
+		// ИСПРАВЛЕНИЕ: Отправляем через то же соединение, что слушаем
+		_, err := conn.WriteToUDP(discoveryPacket, addr)
+		if err != nil {
 			c.log(fmt.Sprintf("Failed to send discovery packet: %v", err))
 			continue
 		}
 
-		// Ждем ответ с таймаутом
-		responseConn.SetReadDeadline(time.Now().Add(DISCOVERY_ATTEMPT_TIMEOUT * time.Second)) // ИЗМЕНЕНО: с 5 на DISCOVERY_ATTEMPT_TIMEOUT
+		// Ждем ответ с таймаутом на том же соединении
+		conn.SetReadDeadline(time.Now().Add(DISCOVERY_ATTEMPT_TIMEOUT * time.Second))
 		buffer := make([]byte, 1024)
 
-		n, serverAddr, err := responseConn.ReadFromUDP(buffer)
+		n, serverAddr, err := conn.ReadFromUDP(buffer)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				if i < discoveryAttempts-1 { // Если не последняя попытка
+				if i < discoveryAttempts-1 {
 					c.log(fmt.Sprintf("Discovery timeout, waiting %d seconds before retry...", DISCOVERY_RETRY_INTERVAL))
-					time.Sleep(DISCOVERY_RETRY_INTERVAL * time.Second) // ДОБАВЛЕНО: пауза между попытками
+					time.Sleep(DISCOVERY_RETRY_INTERVAL * time.Second)
 				}
-				continue // Таймаут, пробуем еще раз
+				continue
 			}
 			c.log(fmt.Sprintf("Error reading discovery response: %v", err))
 			if i < discoveryAttempts-1 {
-				time.Sleep(DISCOVERY_RETRY_INTERVAL * time.Second) // ДОБАВЛЕНО: пауза при ошибке
-			} else {
-				c.log(fmt.Sprintf("Received %d bytes from server %v", n, serverAddr)) // ДОБАВЛЕНО
+				time.Sleep(DISCOVERY_RETRY_INTERVAL * time.Second)
 			}
 			continue
 		}
 
+		c.log(fmt.Sprintf("Received %d bytes from server %v", n, serverAddr))
+
 		// Парсим ответ
-		if n >= 82 { // ИЗМЕНЕНО: с 50 на 82 - минимальный размер HandshakeResponse
-			c.log(fmt.Sprintf("Parsing handshake response (%d bytes)", n)) // ДОБАВЛЕНО
+		if n >= 83 { // Минимальный размер HandshakeResponse
+			c.log(fmt.Sprintf("Parsing handshake response (%d bytes)", n))
 			response, err := c.parseHandshakeResponse(buffer[:n])
 			if err != nil {
 				c.log(fmt.Sprintf("Invalid handshake response: %v", err))
@@ -317,8 +318,6 @@ func (c *VPNClient) DiscoverAndConnect() error {
 			if err := c.connectDTLS(serverAddr, response); err != nil {
 				c.log(fmt.Sprintf("DTLS connection failed: %v", err))
 				continue
-			} else {
-				c.log(fmt.Sprintf("Response too small: %d bytes, expected at least 82", n)) // ДОБАВЛЕНО
 			}
 
 			c.connMu.Lock()
@@ -336,6 +335,8 @@ func (c *VPNClient) DiscoverAndConnect() error {
 			go c.handleServerPackets()
 
 			return nil
+		} else {
+			c.log(fmt.Sprintf("Response too small: %d bytes, expected at least 83", n))
 		}
 	}
 
@@ -390,30 +391,47 @@ func (c *VPNClient) parseHandshakeResponse(data []byte) (*HandshakeResponse, err
 	return response, nil
 }
 
-// Установка DTLS соединения
+// Установка DTLS соединения - ОТЛАДОЧНАЯ ВЕРСИЯ (клиент)
 func (c *VPNClient) connectDTLS(serverAddr *net.UDPAddr, response *HandshakeResponse) error {
-	c.log("Establishing DTLS connection...")
+	c.log("🔐 Establishing DTLS connection...")
+	c.log(fmt.Sprintf("🎯 Server address: %v", serverAddr))
+	c.log(fmt.Sprintf("🔑 Session ID: %x", response.SessionID[:8]))
+	c.log(fmt.Sprintf("🚪 DTLS Port: %d", response.DTLSPort))
 
-	// Теперь у нас полный uncompressed публичный ключ сервера  // ИЗМЕНЕНО: compressed на uncompressed
+	// Проверяем публичный ключ сервера
+	c.log(fmt.Sprintf("🔍 Server public key (first 8 bytes): %x", response.PublicKey[:8]))
+	c.log(fmt.Sprintf("🔍 Server public key format: length=65, prefix=%02x", response.PublicKey[0]))
+
+	// Создаем публичный ключ сервера
 	serverPublicKey, err := ecdh.P256().NewPublicKey(response.PublicKey[:])
 	if err != nil {
+		c.log(fmt.Sprintf("❌ Invalid server public key: %v", err))
 		return fmt.Errorf("invalid server public key: %v", err)
 	}
+	c.log("✅ Server public key validated")
 
+	// Выполняем ECDH
+	c.log("🤝 Performing ECDH key exchange...")
 	sharedSecret, err := c.privateKey.ECDH(serverPublicKey)
 	if err != nil {
+		c.log(fmt.Sprintf("❌ ECDH failed: %v", err))
 		return fmt.Errorf("ECDH failed: %v", err)
 	}
+	c.log(fmt.Sprintf("✅ ECDH successful, shared secret: %d bytes", len(sharedSecret)))
 
 	// Комбинируем с PSK
+	c.log("🔑 Combining ECDH secret with PSK...")
 	hasher := sha256.New()
 	hasher.Write(sharedSecret)
 	hasher.Write([]byte(SHARED_SECRET))
 	c.sharedKey = hasher.Sum(nil)
+	c.log(fmt.Sprintf("✅ Combined key generated: %d bytes", len(c.sharedKey)))
 
 	// DTLS конфигурация
+	c.log("⚙️ Configuring DTLS...")
 	config := &dtls.Config{
 		PSK: func(hint []byte) ([]byte, error) {
+			c.log(fmt.Sprintf("🔐 PSK callback called with hint: %q", string(hint)))
 			return []byte(SHARED_SECRET), nil
 		},
 		PSKIdentityHint: []byte("vpn-client"),
@@ -425,27 +443,69 @@ func (c *VPNClient) connectDTLS(serverAddr *net.UDPAddr, response *HandshakeResp
 		IP:   serverAddr.IP,
 		Port: int(response.DTLSPort),
 	}
+	c.log(fmt.Sprintf("🌐 Connecting to DTLS server: %v", dtlsAddr))
 
 	conn, err := dtls.Dial("udp", dtlsAddr, config)
 	if err != nil {
+		c.log(fmt.Sprintf("❌ DTLS dial failed: %v", err))
 		return fmt.Errorf("DTLS dial failed: %v", err)
 	}
 
+	c.log("🔗 DTLS connection established, getting connection info...")
+
+	// conn уже является *dtls.Conn, так как возвращается из dtls.Dial
 	c.dtlsConn = conn
-	c.log("DTLS connection established successfully")
+	c.log(fmt.Sprintf("✅ DTLS connection assigned"))
+	c.log(fmt.Sprintf("🔍 Local address: %v", conn.LocalAddr()))
+	c.log(fmt.Sprintf("🔍 Remote address: %v", conn.RemoteAddr()))
+
+	// Проверим состояние соединения
+	c.log("🧪 Testing DTLS connection with small write/read...")
+	testData := []byte("PING")
+
+	// Устанавливаем таймаут для теста
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	n, err := conn.Write(testData)
+	if err != nil {
+		c.log(fmt.Sprintf("⚠️ DTLS test write failed: %v", err))
+	} else {
+		c.log(fmt.Sprintf("✅ DTLS test write successful: %d bytes", n))
+	}
+
+	// Убираем дедлайн
+	conn.SetWriteDeadline(time.Time{})
+
+	c.log("🎉 DTLS connection established successfully")
 	return nil
 }
 
 // === ОБРАБОТКА ПАКЕТОВ СЕРВЕРА ===
 
-// Обработка пакетов от сервера
+// Обработка пакетов от сервера - ОТЛАДОЧНАЯ ВЕРСИЯ
 func (c *VPNClient) handleServerPackets() {
-	defer c.dtlsConn.Close()
+	defer func() {
+		c.log("🚪 Server packet handler shutting down")
+		if c.dtlsConn != nil {
+			c.dtlsConn.Close()
+		}
+	}()
+
+	if c.dtlsConn == nil {
+		c.log("❌ DTLS connection is nil!")
+		return
+	}
+
+	c.log("🔄 Starting server packet handler...")
+	c.log(fmt.Sprintf("🔗 DTLS connection: %v -> %v", c.dtlsConn.LocalAddr(), c.dtlsConn.RemoteAddr()))
+
 	buffer := make([]byte, MAX_PACKET_SIZE)
+	consecutiveErrors := 0
+	maxConsecutiveErrors := 3
 
 	for {
 		select {
 		case <-c.stopChan:
+			c.log("🛑 Stop signal received, exiting packet handler")
 			return
 		default:
 		}
@@ -453,16 +513,41 @@ func (c *VPNClient) handleServerPackets() {
 		// Читаем пакет
 		c.dtlsConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		n, err := c.dtlsConn.Read(buffer)
+
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				c.log("⏰ Read timeout, sending heartbeat...")
+				// Отправляем heartbeat при таймауте
+				go func() {
+					select {
+					case c.heartbeatChan <- struct{}{}:
+					default:
+					}
+				}()
 				continue
 			}
-			c.log(fmt.Sprintf("Server connection lost: %v", err))
-			c.onConnectionLost()
-			return
+
+			consecutiveErrors++
+			c.log(fmt.Sprintf("❌ Server read error #%d: %v", consecutiveErrors, err))
+
+			if consecutiveErrors >= maxConsecutiveErrors {
+				c.log(fmt.Sprintf("❌ Too many consecutive errors (%d), closing connection", consecutiveErrors))
+				c.onConnectionLost()
+				return
+			}
+
+			// Короткая пауза перед повторной попыткой
+			time.Sleep(time.Second)
+			continue
 		}
 
+		// Сбрасываем счетчик ошибок при успешном чтении
+		consecutiveErrors = 0
+
+		c.log(fmt.Sprintf("📦 Received packet from server: %d bytes", n))
+
 		if n < 20 { // Минимальный размер заголовка
+			c.log(fmt.Sprintf("⚠️ Packet too small: %d bytes, expected at least 20", n))
 			continue
 		}
 
@@ -473,12 +558,16 @@ func (c *VPNClient) handleServerPackets() {
 		header.Length = binary.LittleEndian.Uint32(buffer[8:12])
 		header.Timestamp = int64(binary.LittleEndian.Uint64(buffer[12:20]))
 
+		c.log(fmt.Sprintf("📋 Packet header: Type=%d, ID=%d, Length=%d, Timestamp=%d",
+			header.Type, header.ID, header.Length, header.Timestamp))
+
 		if header.Length > MAX_PACKET_SIZE-20 {
-			c.log("Received packet too large, ignoring")
+			c.log(fmt.Sprintf("❌ Packet too large: %d bytes (max %d)", header.Length, MAX_PACKET_SIZE-20))
 			continue
 		}
 
 		payload := buffer[20 : 20+header.Length]
+		c.log(fmt.Sprintf("📦 Payload: %d bytes", len(payload)))
 
 		// Обновляем статистику
 		c.connMu.Lock()
@@ -1216,35 +1305,59 @@ func (c *VPNClient) StopDNSServer() error {
 
 // === УПРАВЛЕНИЕ СОЕДИНЕНИЕМ ===
 
-// Обработка потери соединения
+// Обработка потери соединения - УЛУЧШЕННАЯ ВЕРСИЯ
 func (c *VPNClient) onConnectionLost() {
+	c.log("💔 Connection lost event triggered")
+
 	c.connMu.Lock()
+	wasConnected := c.isConnected
 	c.isConnected = false
 	c.connectionState = "Connection Lost"
 	c.reconnectCount++
 	c.connMu.Unlock()
 
-	c.log("Connection to server lost")
+	if !wasConnected {
+		c.log("ℹ️ Connection was already marked as lost")
+		return
+	}
+
+	c.log("🚨 Connection to server lost")
+	c.log(fmt.Sprintf("🔄 Reconnect count: %d", c.reconnectCount))
+
+	// Очищаем DTLS соединение
+	if c.dtlsConn != nil {
+		c.log("🚪 Closing DTLS connection")
+		c.dtlsConn.Close()
+		c.dtlsConn = nil
+	}
 
 	// Очищаем соединения
+	c.log("🧹 Cleaning up TCP connections...")
 	c.tcpConnMu.Lock()
+	tcpCount := len(c.tcpConnections)
 	for _, conn := range c.tcpConnections {
 		conn.mu.Lock()
 		conn.State = "disconnected"
 		conn.mu.Unlock()
 	}
 	c.tcpConnMu.Unlock()
+	c.log(fmt.Sprintf("🧹 Cleaned up %d TCP connections", tcpCount))
 
+	c.log("🧹 Cleaning up UDP connections...")
 	c.udpConnMu.Lock()
+	udpCount := len(c.udpConnections)
 	for _, conn := range c.udpConnections {
 		conn.mu.Lock()
 		conn.State = "disconnected"
 		conn.mu.Unlock()
 	}
 	c.udpConnMu.Unlock()
+	c.log(fmt.Sprintf("🧹 Cleaned up %d UDP connections", udpCount))
 
 	// Очищаем pending requests
+	c.log("🧹 Cleaning up pending requests...")
 	c.requestsMu.Lock()
+	requestCount := len(c.pendingRequests)
 	for _, pending := range c.pendingRequests {
 		select {
 		case pending.ErrorCh <- fmt.Errorf("connection lost"):
@@ -1253,6 +1366,9 @@ func (c *VPNClient) onConnectionLost() {
 	}
 	c.pendingRequests = make(map[uint32]*PendingRequest)
 	c.requestsMu.Unlock()
+	c.log(fmt.Sprintf("🧹 Cleaned up %d pending requests", requestCount))
+
+	c.log("💔 Connection cleanup completed")
 }
 
 // Отключение от сервера
@@ -1364,22 +1480,25 @@ func (c *VPNClient) setConnectionState(state string) {
 }
 
 // Логирование
+// Безопасный метод логирования для клиента
 func (c *VPNClient) log(message string) {
 	timestamp := time.Now().Format("15:04:05")
 	logMessage := fmt.Sprintf("[%s] %s", timestamp, message)
 
+	// Неблокирующая отправка в канал
 	select {
 	case c.logChan <- logMessage:
 	default:
-		// Канал переполнен
+		// Канал переполнен, пропускаем (избегаем блокировки)
 	}
 
+	// Также выводим в консоль
 	log.Println(message)
 }
 
 // === GUI ===
 
-// Создание GUI интерфейса
+// Создание GUI интерфейса - ИСПРАВЛЕННАЯ ВЕРСИЯ для клиента
 func (c *VPNClient) CreateGUI() fyne.Window {
 	myApp := app.New()
 	myWindow := myApp.NewWindow("VPN Relay Client")
@@ -1391,19 +1510,30 @@ func (c *VPNClient) CreateGUI() fyne.Window {
 
 	c.connectionLabel = widget.NewLabel("Server: Not connected")
 
-	// Кнопки управления
+	// Кнопки управления подключением
 	c.connectButton = widget.NewButton("Connect to Server", func() {
+		// Отключаем кнопку сразу в UI thread
+		c.connectButton.Disable()
+
+		// Запускаем подключение в отдельной горутине
 		go func() {
-			c.connectButton.Disable()
+			defer func() {
+				// Включаем кнопку обратно через fyne.NewWithoutData
+				fyne.NewWithoutData(func() {
+					c.connectButton.Enable()
+				}).Run()
+			}()
+
 			if err := c.DiscoverAndConnect(); err != nil {
 				c.log(fmt.Sprintf("Connection failed: %v", err))
 			}
-			c.connectButton.Enable()
 		}()
 	})
 
 	c.disconnectButton = widget.NewButton("Disconnect", func() {
-		go c.Disconnect()
+		go func() {
+			c.Disconnect()
+		}()
 	})
 	c.disconnectButton.Disable()
 
@@ -1415,6 +1545,7 @@ func (c *VPNClient) CreateGUI() fyne.Window {
 	c.httpPortEntry = widget.NewEntry()
 	c.httpPortEntry.SetText(fmt.Sprintf("%d", c.httpProxyPort))
 	c.httpPortEntry.OnChanged = func(text string) {
+		// OnChanged уже вызывается в UI thread
 		if port := parseInt(text); port > 0 && port < 65536 {
 			c.httpProxyPort = port
 		}
@@ -1430,23 +1561,31 @@ func (c *VPNClient) CreateGUI() fyne.Window {
 
 	// Кнопки сервисов
 	startHTTPButton := widget.NewButton("Start HTTP Proxy", func() {
-		if err := c.StartHTTPProxy(); err != nil {
-			c.log(fmt.Sprintf("Failed to start HTTP proxy: %v", err))
-		}
+		go func() {
+			if err := c.StartHTTPProxy(); err != nil {
+				c.log(fmt.Sprintf("Failed to start HTTP proxy: %v", err))
+			}
+		}()
 	})
 
 	stopHTTPButton := widget.NewButton("Stop HTTP Proxy", func() {
-		c.StopHTTPProxy()
+		go func() {
+			c.StopHTTPProxy()
+		}()
 	})
 
 	startDNSButton := widget.NewButton("Start DNS Server", func() {
-		if err := c.StartDNSServer(); err != nil {
-			c.log(fmt.Sprintf("Failed to start DNS server: %v", err))
-		}
+		go func() {
+			if err := c.StartDNSServer(); err != nil {
+				c.log(fmt.Sprintf("Failed to start DNS server: %v", err))
+			}
+		}()
 	})
 
 	stopDNSButton := widget.NewButton("Stop DNS Server", func() {
-		c.StopDNSServer()
+		go func() {
+			c.StopDNSServer()
+		}()
 	})
 
 	// Тестовые кнопки
@@ -1624,7 +1763,7 @@ func (c *VPNClient) CreateGUI() fyne.Window {
 
 	myWindow.SetContent(content)
 
-	// Запускаем обновление GUI
+	// ВАЖНО: Запускаем обновление GUI в основном потоке после создания окна
 	go c.updateGUI()
 
 	// Обработчик закрытия
@@ -1636,7 +1775,7 @@ func (c *VPNClient) CreateGUI() fyne.Window {
 	return myWindow
 }
 
-// Обновление GUI
+// Исправленный updateGUI для клиента
 func (c *VPNClient) updateGUI() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -1646,28 +1785,36 @@ func (c *VPNClient) updateGUI() {
 		case <-c.stopChan:
 			return
 		case logMessage := <-c.logChan:
+			// ИСПРАВЛЕНИЕ: Обновление GUI через fyne.NewWithoutData
 			if c.logText != nil {
-				currentText := c.logText.Text
-				newText := currentText + logMessage + "\n"
+				// Используем NewWithoutData для безопасного обновления из горутины
+				fyne.NewWithoutData(func() {
+					currentText := c.logText.Text
+					newText := currentText + logMessage + "\n"
 
-				// Ограничиваем размер лога
-				lines := strings.Split(newText, "\n")
-				if len(lines) > 1000 {
-					lines = lines[len(lines)-1000:]
-					newText = strings.Join(lines, "\n")
-				}
+					// Ограничиваем размер лога
+					lines := strings.Split(newText, "\n")
+					if len(lines) > 1000 {
+						lines = lines[len(lines)-1000:]
+						newText = strings.Join(lines, "\n")
+					}
 
-				c.logText.SetText(newText)
-				c.logText.CursorRow = len(lines) - 1
+					c.logText.SetText(newText)
+					c.logText.CursorRow = len(lines) - 1
+				}).Run()
 			}
 		case <-ticker.C:
-			c.updateStatus()
+			// ИСПРАВЛЕНИЕ: Обновление статуса через fyne.NewWithoutData
+			fyne.NewWithoutData(func() {
+				c.updateStatus()
+			}).Run()
 		}
 	}
 }
 
-// Обновление статуса
+// Исправленный updateStatus для клиента
 func (c *VPNClient) updateStatus() {
+	// Эта функция теперь вызывается ТОЛЬКО из UI thread через fyne.NewWithoutData
 	if c.statusLabel == nil {
 		return
 	}
